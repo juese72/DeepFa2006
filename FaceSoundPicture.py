@@ -1,512 +1,1047 @@
-import time
+import math
+import multiprocessing
+from queue import Queue
+import os
+
+import sys
 from pathlib import Path
+
+import cv2
 import numpy as np
-from xlib import os as lib_os
-from xlib.mp import csw as lib_csw
+from numpy import linalg as npla
 
-# -------- 修复：异常语句行残留标记 & 安全导入 sounddevice --------
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-import threading, queue, platform
+import facelib
+from core import imagelib
+from core import mathlib
+from facelib import FaceType, LandmarksProcessor
+from core.interact import interact as io
+from core.joblib import Subprocessor, Undaemonize
+from core.leras import nn
+from core import pathex
+from core.cv2ex import *
+from DFLIMG import *
 
-# -------- 新增：bc_out 输出独占，避免并发写导致闪烁 --------
-_BC_OUT_LOCK = threading.Lock()
-_BC_OUT_OWNER = {}
+DEBUG = False
 
-from .BackendBase import (BackendConnection, BackendDB, BackendHost,
-                          BackendSignal, BackendWeakHeap, BackendWorker,
-                          BackendWorkerState)
+class ExtractSubprocessor(Subprocessor):
+    class Data(object):
+        def __init__(self, image=None, filepath=None, rects=None, landmarks = None, landmarks_accurate=True, manual=False, force_output_path=None, final_output_files = None):
+            self.image = image
+            self.filepath = filepath
+            self.idx = None
+            self.rects = rects or []
+            self.rects_rotation = 0
+            self.landmarks_accurate = landmarks_accurate
+            self.manual = manual
+            self.landmarks = landmarks or []
+            self.force_output_path = force_output_path
+            self.final_output_files = final_output_files or []
+            self.faces_detected = 0
 
-# NOTE: This panel is now AUDIO SYNC ONLY.
-# Face wrap / face swap functionality has been fully removed for this UI to avoid any GPU/CPU overhead.
-# Frames are passed through unchanged; only microphone->speaker delay is handled here.
+    class Cli(Subprocessor.Cli):
 
-class FaceSoundPicture(BackendHost):
-    def __init__(self, weak_heap : BackendWeakHeap, reemit_frame_signal : BackendSignal, bc_in : BackendConnection, bc_out : BackendConnection, faces_path : Path, backend_db : BackendDB = None,
-                  id : int = 0):
-        self._id = id
-        super().__init__(backend_db=backend_db,
-                         sheet_cls=Sheet,
-                         worker_cls=FaceSoundPictureWorker,
-                         worker_state_cls=WorkerState,
-                         worker_start_args=[weak_heap, reemit_frame_signal, bc_in, bc_out, faces_path])
-
-    def get_control_sheet(self) -> 'Sheet.Host': return super().get_control_sheet()
-
-    def _get_name(self):
-        return super()._get_name()
-
-class FaceSoundPictureWorker(BackendWorker):
-    def get_state(self) -> 'WorkerState': return super().get_state()
-    def get_control_sheet(self) -> 'Sheet.Worker': return super().get_control_sheet()
-
-    def on_start(self, weak_heap : BackendWeakHeap, reemit_frame_signal : BackendSignal, bc_in : BackendConnection, bc_out : BackendConnection, faces_path : Path):
-        self.weak_heap = weak_heap
-        self.reemit_frame_signal = reemit_frame_signal
-        self.bc_in = bc_in
-        self.bc_out = bc_out
-        self.faces_path = faces_path
-
-        # 新增：bc_out 所有权标记
-        self._owns_bc_out = False
-
-        self.pending_bcd = None
-
-        lib_os.set_timer_resolution(1)
-
-        state, cs = self.get_state(), self.get_control_sheet()
-
-        # === AV Sync bindings ===
-        cs.mic_device.call_on_selected(self.on_cs_mic)
-        cs.spk_device.call_on_selected(self.on_cs_spk)
-        cs.av_delay_ms.call_on_number(self.on_cs_delay)
-        cs.av_delay_enable.call_on_selected(self.on_cs_av_delay_enable)
-
-        # 绑定刷新设备列表信号
-        if hasattr(cs, 'refresh_devices'):
-            cs.refresh_devices.call_on_signal(self._on_refresh_devices)
-            cs.refresh_devices.enable()
-
-        # 初始化并填充设备列表（仅在 Windows 显示真实列表；其他平台仅给默认项）
-        self._populate_audio_devices()
-
-        # 初始化延迟开关（默认关闭）
-        cs.av_delay_enable.enable()
-        cs.av_delay_enable.set_choices(['关闭','开启'])
-        if state.av_delay_enable:
-            cs.av_delay_enable.select('开启')
-        else:
-            cs.av_delay_enable.select('关闭')
-
-        # 如果持久化状态为已开启，则尝试在启动时占用输出通道
-        if state.av_delay_enable and not getattr(self, '_owns_bc_out', False):
-            self._claim_bc_out()
-
-        # 设置默认延迟 2500ms
-        cs.av_delay_ms.enable()
-        cs.av_delay_ms.set_config(lib_csw.Number.Config(min=0, max=10000, step=10, decimals=0, allow_instant_update=True))
-        default_delay = 2500 if state.av_delay_ms is None else int(state.av_delay_ms)
-        cs.av_delay_ms.set_number(default_delay)
-        state.av_delay_ms = default_delay
-
-        # 启动/重建音频延迟引擎（开关关闭或设备未选时会直接返回）
-        self._rebuild_engine()
-
-    # -------- 新增：占用/释放 bc_out 的帮助方法 --------
-    def _claim_bc_out(self):
-        key = id(self.bc_out)
-        with _BC_OUT_LOCK:
-            owner = _BC_OUT_OWNER.get(key)
-            if owner is None or owner is self:
-                _BC_OUT_OWNER[key] = self
-                self._owns_bc_out = True
-                return True
-            return False
-
-    def _release_bc_out(self):
-        key = id(self.bc_out)
-        with _BC_OUT_LOCK:
-            owner = _BC_OUT_OWNER.get(key)
-            if owner is self:
-                _BC_OUT_OWNER.pop(key, None)
-        self._owns_bc_out = False
-
-    def _populate_audio_devices(self):
-        state, cs = self.get_state(), self.get_control_sheet()
-        names_in, names_out, def_in, def_out = self._enum_audio_devices()
-
-        # Mic selector
-        cs.mic_device.enable()
-        cs.mic_device.set_choices(names_in or [], none_choice_name='@misc.menu_select')
-        # Priority: persisted state -> system default -> unselect
-        mic_sel = state.mic_device if (state.mic_device in (names_in or [])) else (def_in if def_in in (names_in or []) else None)
-        if mic_sel is not None:
-            cs.mic_device.select(mic_sel)
-        else:
-            cs.mic_device.unselect()
-        state.mic_device = mic_sel
-
-        # Speaker selector
-        cs.spk_device.enable()
-        cs.spk_device.set_choices(names_out or [], none_choice_name='@misc.menu_select')
-        spk_sel = state.spk_device if (state.spk_device in (names_out or [])) else (def_out if def_out in (names_out or []) else None)
-        if spk_sel is not None:
-            cs.spk_device.select(spk_sel)
-        else:
-            cs.spk_device.unselect()
-        state.spk_device = spk_sel
-
-    def _enum_audio_devices(self):
-        """Returns (input_names, output_names, default_input_name, default_output_name)
-        - Names are raw device names (no host API suffix)
-        - Defaults are raw names or None if unknown
-        """
-        if platform.system().lower() != 'windows' or sd is None:
-            return [], [], None, None
-        try:
-            devices = sd.query_devices()
-            inputs, outputs = [], []
-            for d in devices:
-                name = d.get('name', '')
-                if not name:
-                    continue
-                if d.get('max_input_channels', 0) > 0 and name not in inputs:
-                    inputs.append(name)
-                if d.get('max_output_channels', 0) > 0 and name not in outputs:
-                    outputs.append(name)
-            # Resolve default names from indices, if provided
-            def_in = def_out = None
-            try:
-                di, do = sd.default.device
-                if isinstance(di, int) and 0 <= di < len(devices):
-                    def_in = devices[di].get('name') or None
-                if isinstance(do, int) and 0 <= do < len(devices):
-                    def_out = devices[do].get('name') or None
-            except Exception:
-                pass
-            return inputs, outputs, def_in, def_out
-        except Exception:
-            return [], [], None, None
-
-    def _rebuild_engine(self):
-        # Stop existing
-        try:
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                self._audio_engine.stop(); self._audio_engine = None
-        except Exception:
-            self._audio_engine = None
-        # Build new only when devices are selected AND delay effect is enabled
-        st = self.get_state()
-        if not getattr(st, 'av_delay_enable', False):
-            return
-        if st.mic_device is None or st.spk_device is None:
-            return
-        # 新增：必须已经占有 bc_out 才能创建引擎
-        if not getattr(self, '_owns_bc_out', False):
-            return
-        self._audio_engine = AudioDelayEngine(self)
-        self._audio_engine.start()
-
-    def _norm_sel(self, v):
-        # 将占位项或空值标准化为 None
-        if v is None:
-            return None
-        if isinstance(v, str) and v.startswith('@'):
-            return None
-        return v
-
-    def on_cs_mic(self, idx, name):
-        st = self.get_state()
-        st.mic_device = self._norm_sel(name)
-        self.save_state()
-        if st.mic_device is not None and st.spk_device is not None and getattr(st, 'av_delay_enable', False) and getattr(self, '_owns_bc_out', False):
-            self._rebuild_engine()
-        else:
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                try:
-                    self._audio_engine.stop()
-                except Exception:
-                    pass
-                self._audio_engine = None
-        self.reemit_frame_signal.send()
-
-    def on_cs_spk(self, idx, name):
-        st = self.get_state()
-        st.spk_device = self._norm_sel(name)
-        self.save_state()
-        if st.mic_device is not None and st.spk_device is not None and getattr(st, 'av_delay_enable', False) and getattr(self, '_owns_bc_out', False):
-            self._rebuild_engine()
-        else:
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                try:
-                    self._audio_engine.stop()
-                except Exception:
-                    pass
-                self._audio_engine = None
-        self.reemit_frame_signal.send()
-
-    def on_cs_delay(self, v):
-        st, cs = self.get_state(), self.get_control_sheet()
-        cfg = cs.av_delay_ms.get_config()
-        st.av_delay_ms = int(np.clip(v, cfg.min, cfg.max)); cs.av_delay_ms.set_number(st.av_delay_ms)
-        self.save_state();
-        if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-            self._audio_engine.set_delay_ms(st.av_delay_ms)
-        self.reemit_frame_signal.send()
-
-    # -------- 替换：开启前先抢占 bc_out；占不到则自动回退为关闭 --------
-    def on_cs_av_delay_enable(self, idx, name):
-        st = self.get_state()
-        cs = self.get_control_sheet()
-        # 将选择名称映射为布尔开关
-        on_names = {'开启', 'On', 'ON', 'on', '1', 1, True}
-        st.av_delay_enable = (name in on_names)
-        self.save_state()
-        # 根据开关启动/停止引擎；开启时先尝试占用输出，关闭时释放
-        if st.av_delay_enable:
-            if not getattr(self, '_owns_bc_out', False):
-                if not self._claim_bc_out():
-                    # 无法占用输出：回退为关闭，避免与其他换脸模块并发写导致闪烁
-                    st.av_delay_enable = False
-                    try:
-                        cs.av_delay_enable.select('关闭')
-                    except Exception:
-                        pass
-                    if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                        try:
-                            self._audio_engine.set_delay_ms(0)
-                            self._audio_engine.stop()
-                        except Exception:
-                            pass
-                        self._audio_engine = None
-                    self.save_state(); self.reemit_frame_signal.send(); return
-            # 拿到所有权，启动/更新引擎
-            if getattr(self, '_audio_engine', None) is None:
-                self._rebuild_engine()
+        def frames_generator(self, video_path, fps, queue_out: Queue, chunk_size=0):
+            major_ver, _, _ = cv2.__version__.split('.')
+            video = cv2.VideoCapture(str(video_path))
+            
+            if int(major_ver) < 3:
+                framerate = video.get(cv2.cv.CV_CAP_PROP_FPS)
             else:
-                try:
-                    self._audio_engine.set_delay_ms(int(st.av_delay_ms))
-                except Exception:
-                    pass
+                framerate = video.get(cv2.CAP_PROP_FPS)
+            
+            count = 0
+            idx = 0
+            # Number of iteration without size check
+            check_rate = 30
+            # Current iteration
+            tick = 0
+            # True when queue reached the chunk_size
+            wait = False
+
+            # if the chunk_size is not specified set it to 50 and let check_rate to the default value
+            if chunk_size == 0:
+                chunk_size = 50
+            else:
+                # else set the check_rate to the 30% of the chunk_size
+                check_rate = int(chunk_size * 30 / 100)
+
+            success, image = video.read()
+            success = True
+            if fps != 0:
+                fps_to_extract = round(math.floor(framerate) / fps, 3)
+            else:
+                fps_to_extract = 1
+
+            while success:
+                video.set(cv2.CAP_PROP_POS_FRAMES, count)
+                success, image = video.read()
+                if success:
+                    # If true, it's time to check the queue size
+                    if tick == check_rate:
+                        while True:
+                            if not wait:
+                                # if true we reached the max chunk size
+                                if queue_out.qsize() >= chunk_size:
+                                    wait = True
+                                else:
+                                    # we didn't reach the max chunk size so we can continue to put
+                                    # frames in the queue
+                                    queue_out.put((image, idx))
+                                    count += fps_to_extract
+                                    idx += 1
+                                    tick = 0
+                                    break
+                            else:
+                                # if true, the queue has the right size to continue to extract frames
+                                if queue_out.qsize() <= chunk_size - check_rate:
+                                    wait = False
+                                    tick = 0
+                                    break
+                    else:
+                        # it's still not time to check the queue size
+                        queue_out.put((image, idx))
+                        count += fps_to_extract
+                        idx += 1
+                        tick += 1
+
+            video.release()
+
+        #override
+        def on_initialize(self, client_dict):
+            self.type                 = client_dict['type']
+            self.image_size           = client_dict['image_size']
+            self.jpeg_quality         = client_dict['jpeg_quality']
+            self.face_type            = client_dict['face_type']
+            self.max_faces_from_image = client_dict['max_faces_from_image']
+            self.device_idx           = client_dict['device_idx']
+            self.cpu_only             = client_dict['device_type'] == 'CPU'
+            self.final_output_path    = client_dict['final_output_path']
+            self.output_debug_path    = client_dict['output_debug_path']
+            self.video_path           = client_dict['video_path']
+            fps                       = client_dict['fps']
+            chunk_size                = client_dict['chunk_size']
+
+            #transfer and set stdin in order to work code.interact in debug subprocess
+            stdin_fd         = client_dict['stdin_fd']
+            if stdin_fd is not None and DEBUG:
+                sys.stdin = os.fdopen(stdin_fd)
+
+            if self.cpu_only:
+                device_config = nn.DeviceConfig.CPU()
+                place_model_on_cpu = True
+            else:
+                device_config = nn.DeviceConfig.GPUIndexes ([self.device_idx])
+                place_model_on_cpu = device_config.devices[0].total_mem_gb < 4
+
+            if self.type == 'all' or 'rects' in self.type or 'landmarks' in self.type:
+                nn.initialize (device_config)
+
+            self.log_info (f"运行在 {client_dict['device_name'] }")
+
+            if self.type == 'all' or self.type == 'rects-s3fd' or 'landmarks' in self.type:
+                self.rects_extractor = facelib.S3FDExtractor(place_model_on_cpu=place_model_on_cpu)
+
+            if self.type == 'all' or 'landmarks' in self.type:
+                # for head type, extract "3D landmarks"
+                self.landmarks_extractor = facelib.FANExtractor(landmarks_3D=self.face_type >= FaceType.HEAD,
+                                                                place_model_on_cpu=place_model_on_cpu)
+
+            self.cached_image = (None, None)
+
+            if self.video_path is not None:
+                # true when no frame has been processed yet
+                self.first_frame = True
+
+                self.frames_queue = multiprocessing.Queue()
+                if sys.version_info[0] == 3 and sys.version_info[1] > 6:
+                    with Undaemonize():
+                        self.frames_processor = multiprocessing.Process(target=self.frames_generator, args=(self.video_path, fps, self.frames_queue, chunk_size if chunk_size is not None else 0))
+                        self.frames_processor.start()
+                else:
+                    self.frames_processor = multiprocessing.Process(target=self.frames_generator, args=(self.video_path, fps, self.frames_queue, chunk_size if chunk_size is not None else 0))
+                    self.frames_processor.start()
+
+        #override
+        def process_data(self, data):
+            if 'landmarks' in self.type and len(data.rects) == 0:
+                return data
+
+            if not isinstance(data.image, int):
+                filepath = data.filepath
+                cached_filepath, image = self.cached_image
+                if cached_filepath != filepath:
+                    image = cv2_imread( filepath )
+                    if image is None:
+                        self.log_err (f'Failed to open {filepath}, reason: cv2_imread() fail.')
+                        return data
+                    image = imagelib.normalize_channels(image, 3)
+                    image = imagelib.cut_odd_image(image)
+                    self.cached_image = ( filepath, image )
+            else:
+                attempts = 0
+                while True:
+                    if not self.frames_queue.empty():
+                        # if first_frame is true set it to false cause queue finally has a frame inside
+                        if self.first_frame:
+                            self.first_frame = False
+                        image, idx = self.frames_queue.get()
+                        data.idx = f"{idx:{'0'}{5}}"
+                        image = imagelib.normalize_channels(image, 3)
+                        image = imagelib.cut_odd_image(image)
+                        break
+                    else:
+                        # do not increase the attempts counter if we still didn't processed any frames
+                        if not self.first_frame:
+                            attempts += 1
+                            if attempts == 1000:
+                                return data
+
+
+            if 'rects' in self.type or self.type == 'all':
+                data = ExtractSubprocessor.Cli.rects_stage (data=data,
+                                                            image=image,
+                                                            max_faces_from_image=self.max_faces_from_image,
+                                                            rects_extractor=self.rects_extractor,
+                                                            )
+
+            if 'landmarks' in self.type or self.type == 'all':
+                data = ExtractSubprocessor.Cli.landmarks_stage (data=data,
+                                                                image=image,
+                                                                landmarks_extractor=self.landmarks_extractor,
+                                                                rects_extractor=self.rects_extractor,
+                                                                )
+
+            if self.type == 'final' or self.type == 'all':
+                data = ExtractSubprocessor.Cli.final_stage(data=data,
+                                                        image=image,
+                                                        face_type=self.face_type,
+                                                        image_size=self.image_size,
+                                                        jpeg_quality=self.jpeg_quality,
+                                                        output_debug_path=self.output_debug_path,
+                                                        final_output_path=self.final_output_path
+                                                        )
+
+            return data
+
+        @staticmethod
+        def rects_stage(data,
+                        image,
+                        max_faces_from_image,
+                        rects_extractor,
+                        ):
+            h,w,c = image.shape
+            if min(h,w) < 128:
+                # Image is too small
+                data.rects = []
+            else:
+                for rot in ([0, 90, 270, 180]):
+                    if rot == 0:
+                        rotated_image = image
+                    elif rot == 90:
+                        rotated_image = image.swapaxes( 0,1 )[:,::-1,:]
+                    elif rot == 180:
+                        rotated_image = image[::-1,::-1,:]
+                    elif rot == 270:
+                        rotated_image = image.swapaxes( 0,1 )[::-1,:,:]
+                    rects = data.rects = rects_extractor.extract (rotated_image, is_bgr=True)
+                    if len(rects) != 0:
+                        data.rects_rotation = rot
+                        break
+                if max_faces_from_image is not None and \
+                   max_faces_from_image > 0 and \
+                   len(data.rects) > 0:
+                    data.rects = data.rects[0:max_faces_from_image]
+            return data
+
+
+        @staticmethod
+        def landmarks_stage(data,
+                            image,
+                            landmarks_extractor,
+                            rects_extractor,
+                            ):
+            h, w, ch = image.shape
+
+            if data.rects_rotation == 0:
+                rotated_image = image
+            elif data.rects_rotation == 90:
+                rotated_image = image.swapaxes( 0,1 )[:,::-1,:]
+            elif data.rects_rotation == 180:
+                rotated_image = image[::-1,::-1,:]
+            elif data.rects_rotation == 270:
+                rotated_image = image.swapaxes( 0,1 )[::-1,:,:]
+
+            data.landmarks = landmarks_extractor.extract (rotated_image, data.rects, rects_extractor if (data.landmarks_accurate) else None, is_bgr=True)
+            if data.rects_rotation != 0:
+                for i, (rect, lmrks) in enumerate(zip(data.rects, data.landmarks)):
+                    new_rect, new_lmrks = rect, lmrks
+                    (l,t,r,b) = rect
+                    if data.rects_rotation == 90:
+                        new_rect = ( t, h-l, b, h-r)
+                        if lmrks is not None:
+                            new_lmrks = lmrks[:,::-1].copy()
+                            new_lmrks[:,1] = h - new_lmrks[:,1]
+                    elif data.rects_rotation == 180:
+                        if lmrks is not None:
+                            new_rect = ( w-l, h-t, w-r, h-b)
+                            new_lmrks = lmrks.copy()
+                            new_lmrks[:,0] = w - new_lmrks[:,0]
+                            new_lmrks[:,1] = h - new_lmrks[:,1]
+                    elif data.rects_rotation == 270:
+                        new_rect = ( w-b, l, w-t, r )
+                        if lmrks is not None:
+                            new_lmrks = lmrks[:,::-1].copy()
+                            new_lmrks[:,0] = w - new_lmrks[:,0]
+                    data.rects[i], data.landmarks[i] = new_rect, new_lmrks
+
+            return data
+
+        @staticmethod
+        def final_stage(data,
+                        image,
+                        face_type,
+                        image_size,
+                        jpeg_quality,
+                        output_debug_path=None,
+                        final_output_path=None,
+                        ):
+            data.final_output_files = []
+            filepath = data.filepath
+            rects = data.rects
+            landmarks = data.landmarks
+
+            if output_debug_path is not None:
+                debug_image = image.copy()
+
+            face_idx = 0
+            for rect, image_landmarks in zip( rects, landmarks ):
+                if image_landmarks is None:
+                    continue
+
+                rect = np.array(rect)
+
+                if face_type == FaceType.MARK_ONLY:
+                    image_to_face_mat = None
+                    face_image = image
+                    face_image_landmarks = image_landmarks
+                else:
+                    image_to_face_mat = LandmarksProcessor.get_transform_mat (image_landmarks, image_size, face_type)
+
+                    face_image = cv2.warpAffine(image, image_to_face_mat, (image_size, image_size), cv2.INTER_CUBIC)
+                    face_image_landmarks = LandmarksProcessor.transform_points (image_landmarks, image_to_face_mat)
+
+                    landmarks_bbox = LandmarksProcessor.transform_points ( [ (0,0), (0,image_size-1), (image_size-1, image_size-1), (image_size-1,0) ], image_to_face_mat, True)
+
+                    rect_area      = mathlib.polygon_area(np.array(rect[[0,2,2,0]]).astype(np.float32), np.array(rect[[1,1,3,3]]).astype(np.float32))
+                    landmarks_area = mathlib.polygon_area(landmarks_bbox[:,0].astype(np.float32), landmarks_bbox[:,1].astype(np.float32) )
+
+                    if not data.manual and face_type <= FaceType.FULL_NO_ALIGN and landmarks_area > 4*rect_area: #get rid of faces which umeyama-landmark-area > 4*detector-rect-area
+                        continue
+
+                    if output_debug_path is not None:
+                        LandmarksProcessor.draw_rect_landmarks (debug_image, rect, image_landmarks, face_type, image_size, transparent_mask=True)
+
+                output_path = final_output_path
+                if data.force_output_path is not None:
+                    output_path = data.force_output_path
+ 
+
+                if filepath is not None:
+                    output_filepath = output_path / f"{filepath.stem}_{face_idx}.jpg"
+                else:
+                    output_filepath = output_path / f"{data.idx}_{face_idx}.jpg"
+                cv2_imwrite(output_filepath, face_image, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality ] )
+
+                dflimg = DFLJPG.load(output_filepath)
+                dflimg.set_face_type(FaceType.toString(face_type))
+                dflimg.set_landmarks(face_image_landmarks.tolist())
+                if filepath is None:
+                    dflimg.set_source_filename(data.idx)
+                else:
+                    dflimg.set_source_filename(filepath.name)
+                dflimg.set_source_rect(rect)
+                dflimg.set_source_landmarks(image_landmarks.tolist())
+                dflimg.set_image_to_face_mat(image_to_face_mat)
+                dflimg.save()
+
+                data.final_output_files.append (output_filepath)
+                face_idx += 1
+            data.faces_detected = face_idx
+
+            if output_debug_path is not None:
+                if filepath is not None:
+                    cv2_imwrite( output_debug_path / (filepath.stem +'.jpg'), debug_image, [int(cv2.IMWRITE_JPEG_QUALITY), 50] )
+                else:
+                    cv2_imwrite( output_debug_path / (str(data.idx) +'.jpg'), debug_image, [int(cv2.IMWRITE_JPEG_QUALITY), 50] )
+
+            return data
+
+        #overridable
+        def get_data_name (self, data):
+            #return string identificator of your data
+            return data.filepath
+
+        #override
+        def on_finalize(self):
+            self.frames_processor.terminate()
+
+    def count_video_frames(self, video_path, fps):
+            major_ver, _, _ = cv2.__version__.split('.')
+            video = cv2.VideoCapture(str(video_path))
+
+            if int(major_ver) < 3:
+                total_frames = int(video.get(cv2.cv.CV_CAP_PROP_FRAME_COUNT))
+                framerate = video.get(cv2.cv.CV_CAP_PROP_FPS)
+            else:
+                total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+                framerate = video.get(cv2.CAP_PROP_FPS)
+
+            video.release()
+
+            if fps == 0:
+                return total_frames
+            else:
+                return int(math.floor(total_frames / framerate) * fps)
+
+    @staticmethod
+    def get_devices_for_config (type, device_config):
+        devices = device_config.devices
+        cpu_only = len(devices) == 0
+
+        if 'rects'     in type or \
+           'landmarks' in type or \
+           'all'       in type:
+
+            if not cpu_only:
+                if type == 'landmarks-manual':
+                    devices = [devices.get_best_device()]
+
+                result = []
+
+                for device in devices:
+                    count = 1
+
+                    if count == 1:
+                        result += [ (device.index, 'GPU', device.name, device.total_mem_gb) ]
+                    else:
+                        for i in range(count):
+                            result += [ (device.index, 'GPU', f"{device.name} #{i}", device.total_mem_gb) ]
+
+                return result
+            else:
+                if type == 'landmarks-manual':
+                    return [ (0, 'CPU', 'CPU', 0 ) ]
+                else:
+                    return [ (i, 'CPU', 'CPU%d' % (i), 0 ) for i in range( min(8, multiprocessing.cpu_count() // 2) ) ]
+
+        elif type == 'final':
+            return [ (i, 'CPU', 'CPU%d' % (i), 0 ) for i in (range(min(8, multiprocessing.cpu_count())) if not DEBUG else [0]) ]
+
+    def __init__(self,
+                input_data,
+                type,
+                image_size=None,
+                jpeg_quality=None,
+                face_type=None,
+                output_debug_path=None,
+                manual_window_size=0,
+                max_faces_from_image=0,
+                final_output_path=None,
+                video_path=None,
+                fps=None,
+                chunk_size=None,
+                device_config=None):
+
+        if type == 'landmarks-manual':
+            for x in input_data:
+                x.manual = True
+
+        if input_data is None:
+            self.input_data = [ExtractSubprocessor.Data(image=image) for image in range(self.count_video_frames(video_path, fps))]
         else:
-            # 关闭：停止引擎并释放所有权
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                try:
-                    self._audio_engine.set_delay_ms(0)
-                    self._audio_engine.stop()
-                except Exception:
-                    pass
-                self._audio_engine = None
-            self._release_bc_out()
-        self.reemit_frame_signal.send()
+            self.input_data = input_data
 
-    # -------- 替换：设备刷新时也要求“已开启 + 已占有”才重建，否则停机 --------
-    def _on_refresh_devices(self):
-        # 重新枚举并尽量保持/回填选择
-        self._populate_audio_devices()
-        st = self.get_state()
-        if st.mic_device is not None and st.spk_device is not None and getattr(st, 'av_delay_enable', False) and getattr(self, '_owns_bc_out', False):
-            self._rebuild_engine()
+        self.type = type
+        self.image_size = image_size
+        self.jpeg_quality = jpeg_quality
+        self.face_type = face_type
+        self.output_debug_path = output_debug_path
+        self.final_output_path = final_output_path
+        self.manual_window_size = manual_window_size
+        self.max_faces_from_image = max_faces_from_image
+        self.video_path = video_path
+        self.fps = fps
+        self.chunk_size = chunk_size
+        self.result = []
+
+        self.devices = ExtractSubprocessor.get_devices_for_config(self.type, device_config)
+        self.cli = ExtractSubprocessor.Cli
+
+        super().__init__('Extractor', self.cli,
+                             999999 if type == 'landmarks-manual' or DEBUG else 120)
+
+    #override
+    def on_clients_initialized(self):
+        if self.type == 'landmarks-manual':
+            self.wnd_name = 'Manual pass'
+            io.named_window(self.wnd_name)
+            io.capture_mouse(self.wnd_name)
+            io.capture_keys(self.wnd_name)
+
+            self.cache_original_image = (None, None)
+            self.cache_image = (None, None)
+            self.cache_text_lines_img = (None, None)
+            self.hide_help = False
+            self.landmarks_accurate = True
+            self.force_landmarks = False
+
+            self.landmarks = None
+            self.x = 0
+            self.y = 0
+            self.rect_size = 100
+            self.rect_locked = False
+            self.extract_needed = True
+
+            self.image = None
+            self.image_filepath = None
+
+        io.progress_bar (None, len (self.input_data))
+
+    #override
+    def on_clients_finalized(self):
+        if self.type == 'landmarks-manual':
+            io.destroy_all_windows()
+
+        io.progress_bar_close()
+
+    #override
+    def process_info_generator(self):
+        base_dict = {'type' : self.type,
+                     'image_size': self.image_size,
+                     'jpeg_quality' : self.jpeg_quality,
+                     'face_type': self.face_type,
+                     'max_faces_from_image':self.max_faces_from_image,
+                     'output_debug_path': self.output_debug_path,
+                     'final_output_path': self.final_output_path,
+                     'video_path': self.video_path,
+                     'fps':self.fps,
+                     'chunk_size':self.chunk_size,
+                     'stdin_fd': sys.stdin.fileno() }
+
+
+        for (device_idx, device_type, device_name, device_total_vram_gb) in self.devices:
+            client_dict = base_dict.copy()
+            client_dict['device_idx'] = device_idx
+            client_dict['device_name'] = device_name
+            client_dict['device_type'] = device_type
+            yield client_dict['device_name'], {}, client_dict
+
+    #override
+    def get_data(self, host_dict):
+        if self.type == 'landmarks-manual':
+            need_remark_face = False
+            while len (self.input_data) > 0:
+                data = self.input_data[0]
+                filepath, data_rects, data_landmarks = data.filepath, data.rects, data.landmarks
+                is_frame_done = False
+
+                if self.image_filepath != filepath:
+                    self.image_filepath = filepath
+                    if self.cache_original_image[0] == filepath:
+                        self.original_image = self.cache_original_image[1]
+                    else:
+                        self.original_image = imagelib.normalize_channels( cv2_imread( filepath ), 3 )
+
+                        self.cache_original_image = (filepath, self.original_image )
+
+                    (h,w,c) = self.original_image.shape
+                    self.view_scale = 1.0 if self.manual_window_size == 0 else self.manual_window_size / ( h * (16.0/9.0) )
+
+                    if self.cache_image[0] == (h,w,c) + (self.view_scale,filepath):
+                        self.image = self.cache_image[1]
+                    else:
+                        self.image = cv2.resize (self.original_image, ( int(w*self.view_scale), int(h*self.view_scale) ), interpolation=cv2.INTER_LINEAR)
+                        self.cache_image = ( (h,w,c) + (self.view_scale,filepath), self.image )
+
+                    (h,w,c) = self.image.shape
+
+                    sh = (0,0, w, min(100, h) )
+                    if self.cache_text_lines_img[0] == sh:
+                        self.text_lines_img = self.cache_text_lines_img[1]
+                    else:
+                        self.text_lines_img = (imagelib.get_draw_text_lines ( self.image, sh,
+                                                        [   '[L Mouse click] - lock/unlock selection. [Mouse wheel] - change rect',
+                                                            '[R Mouse Click] - manual face rectangle',
+                                                            '[Enter] / [Space] - confirm / skip frame',
+                                                            '[,] [.]- prev frame, next frame. [Q] - skip remaining frames',
+                                                            '[a] - accuracy on/off (more fps)',
+                                                            '[h] - hide this help'
+                                                        ], (1, 1, 1) )*255).astype(np.uint8)
+
+                        self.cache_text_lines_img = (sh, self.text_lines_img)
+
+                if need_remark_face: # need remark image from input data that already has a marked face?
+                    need_remark_face = False
+                    if len(data_rects) != 0: # If there was already a face then lock the rectangle to it until the mouse is clicked
+                        self.rect = data_rects.pop()
+                        self.landmarks = data_landmarks.pop()
+                        data_rects.clear()
+                        data_landmarks.clear()
+
+                        self.rect_locked = True
+                        self.rect_size = ( self.rect[2] - self.rect[0] ) / 2
+                        self.x = ( self.rect[0] + self.rect[2] ) / 2
+                        self.y = ( self.rect[1] + self.rect[3] ) / 2
+                        self.redraw()
+
+                if len(data_rects) == 0:
+                    (h,w,c) = self.image.shape
+                    while True:
+                        io.process_messages(0.0001)
+
+                        if not self.force_landmarks:
+                            new_x = self.x
+                            new_y = self.y
+
+                        new_rect_size = self.rect_size
+
+                        mouse_events = io.get_mouse_events(self.wnd_name)
+                        for ev in mouse_events:
+                            (x, y, ev, flags) = ev
+                            if ev == io.EVENT_MOUSEWHEEL and not self.rect_locked:
+                                mod = 1 if flags > 0 else -1
+                                diff = 1 if new_rect_size <= 40 else np.clip(new_rect_size / 10, 1, 10)
+                                new_rect_size = max (5, new_rect_size + diff*mod)
+                            elif ev == io.EVENT_LBUTTONDOWN:
+                                if self.force_landmarks:
+                                    self.x = new_x
+                                    self.y = new_y
+                                    self.force_landmarks = False
+                                    self.rect_locked = True
+                                    self.redraw()
+                                else:
+                                    self.rect_locked = not self.rect_locked
+                                    self.extract_needed = True
+                            elif ev == io.EVENT_RBUTTONDOWN:
+                                self.force_landmarks = not self.force_landmarks
+                                if self.force_landmarks:
+                                    self.rect_locked = False
+                            elif not self.rect_locked:
+                                new_x = np.clip (x, 0, w-1) / self.view_scale
+                                new_y = np.clip (y, 0, h-1) / self.view_scale
+
+                        key_events = io.get_key_events(self.wnd_name)
+                        key, chr_key, ctrl_pressed, alt_pressed, shift_pressed = key_events[-1] if len(key_events) > 0 else (0,0,False,False,False)
+
+                        if key == ord('\r') or key == ord('\n'):
+                            #confirm frame
+                            is_frame_done = True
+                            data_rects.append (self.rect)
+                            data_landmarks.append (self.landmarks)
+                            break
+                        elif key == ord(' '):
+                            #confirm skip frame
+                            is_frame_done = True
+                            break
+                        elif key == ord(',')  and len(self.result) > 0:
+                            #go prev frame
+
+                            if self.rect_locked:
+                                self.rect_locked = False
+                                # Only save the face if the rect is still locked
+                                data_rects.append (self.rect)
+                                data_landmarks.append (self.landmarks)
+
+
+                            self.input_data.insert(0, self.result.pop() )
+                            io.progress_bar_inc(-1)
+                            need_remark_face = True
+
+                            break
+                        elif key == ord('.'):
+                            #go next frame
+
+                            if self.rect_locked:
+                                self.rect_locked = False
+                                # Only save the face if the rect is still locked
+                                data_rects.append (self.rect)
+                                data_landmarks.append (self.landmarks)
+
+                            need_remark_face = True
+                            is_frame_done = True
+                            break
+                        elif key == ord('q'):
+                            #skip remaining
+
+                            if self.rect_locked:
+                                self.rect_locked = False
+                                data_rects.append (self.rect)
+                                data_landmarks.append (self.landmarks)
+
+                            while len(self.input_data) > 0:
+                                self.result.append( self.input_data.pop(0) )
+                                io.progress_bar_inc(1)
+
+                            break
+
+                        elif key == ord('h'):
+                            self.hide_help = not self.hide_help
+                            break
+                        elif key == ord('a'):
+                            self.landmarks_accurate = not self.landmarks_accurate
+                            break
+
+                        if self.force_landmarks:
+                            pt2 = np.float32([new_x, new_y])
+                            pt1 = np.float32([self.x, self.y])
+
+                            pt_vec_len = npla.norm(pt2-pt1)
+                            pt_vec = pt2-pt1
+                            if pt_vec_len != 0:
+                                pt_vec /= pt_vec_len
+
+                            self.rect_size = pt_vec_len
+                            self.rect = ( int(self.x-self.rect_size),
+                                          int(self.y-self.rect_size),
+                                          int(self.x+self.rect_size),
+                                          int(self.y+self.rect_size) )
+
+                            if pt_vec_len > 0:
+                                lmrks = np.concatenate ( (np.zeros ((17,2), np.float32), LandmarksProcessor.landmarks_2D), axis=0 )
+                                lmrks -= lmrks[30:31,:]
+                                mat = cv2.getRotationMatrix2D( (0, 0), -np.arctan2( pt_vec[1], pt_vec[0] )*180/math.pi , pt_vec_len)
+                                mat[:, 2] += (self.x, self.y)
+                                self.landmarks = LandmarksProcessor.transform_points(lmrks, mat )
+
+
+                            self.redraw()
+
+                        elif self.x != new_x or \
+                           self.y != new_y or \
+                           self.rect_size != new_rect_size or \
+                           self.extract_needed:
+                            self.x = new_x
+                            self.y = new_y
+                            self.rect_size = new_rect_size
+                            self.rect = ( int(self.x-self.rect_size),
+                                          int(self.y-self.rect_size),
+                                          int(self.x+self.rect_size),
+                                          int(self.y+self.rect_size) )
+
+                            return ExtractSubprocessor.Data (filepath=filepath, rects=[self.rect], landmarks_accurate=self.landmarks_accurate)
+
+                else:
+                    is_frame_done = True
+
+                if is_frame_done:
+                    self.result.append ( data )
+                    self.input_data.pop(0)
+                    io.progress_bar_inc(1)
+                    self.extract_needed = True
+                    self.rect_locked = False
         else:
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                try:
-                    self._audio_engine.stop()
-                except Exception:
-                    pass
-                self._audio_engine = None
-        self.reemit_frame_signal.send()
+            if len (self.input_data) > 0:
+                return self.input_data.pop(0)
 
-    # -------- 新增：停止时释放引擎与所有权 --------
-    def on_stop(self):
-        try:
-            if hasattr(self, '_audio_engine') and self._audio_engine is not None:
-                self._audio_engine.stop()
-        except Exception:
-            pass
-        self._audio_engine = None
-        self._release_bc_out()
+        return None
 
-    def on_tick(self):
-        # Audio-only module: do not participate in video pipeline to avoid conflicts with FaceSwap/DFM
+    #override
+    def on_data_return (self, host_dict, data):
+        if self.type == 'landmarks-manual':
+            self.input_data.insert(0, data)
+
+    def redraw(self):
+        (h,w,c) = self.image.shape
+
+        if not self.hide_help:
+            image = cv2.addWeighted (self.image,1.0,self.text_lines_img,1.0,0)
+        else:
+            image = self.image.copy()
+
+        view_rect = (np.array(self.rect) * self.view_scale).astype(np.int).tolist()
+        view_landmarks  = (np.array(self.landmarks) * self.view_scale).astype(np.int).tolist()
+
+        if self.rect_size <= 40:
+            scaled_rect_size = h // 3 if w > h else w // 3
+
+            p1 = (self.x - self.rect_size, self.y - self.rect_size)
+            p2 = (self.x + self.rect_size, self.y - self.rect_size)
+            p3 = (self.x - self.rect_size, self.y + self.rect_size)
+
+            wh = h if h < w else w
+            np1 = (w / 2 - wh / 4, h / 2 - wh / 4)
+            np2 = (w / 2 + wh / 4, h / 2 - wh / 4)
+            np3 = (w / 2 - wh / 4, h / 2 + wh / 4)
+
+            mat = cv2.getAffineTransform( np.float32([p1,p2,p3])*self.view_scale, np.float32([np1,np2,np3]) )
+            image = cv2.warpAffine(image, mat,(w,h) )
+            view_landmarks = LandmarksProcessor.transform_points (view_landmarks, mat)
+
+        landmarks_color = (255,255,0) if self.rect_locked else (0,255,0)
+        LandmarksProcessor.draw_rect_landmarks (image, view_rect, view_landmarks, self.face_type, self.image_size, landmarks_color=landmarks_color)
+        self.extract_needed = False
+
+        io.show_image (self.wnd_name, image)
+
+    #override
+    def on_result (self, host_dict, data, result):
+        if self.type == 'landmarks-manual':
+            filepath, landmarks = result.filepath, result.landmarks
+
+            if len(landmarks) != 0 and landmarks[0] is not None:
+                self.landmarks = landmarks[0]
+
+            self.redraw()
+        else:
+            self.result.append ( result )
+            io.progress_bar_inc(1)
+
+    #override
+    def get_result(self):
+        return self.result
+
+
+class DeletedFilesSearcherSubprocessor(Subprocessor):
+    class Cli(Subprocessor.Cli):
+        #override
+        def on_initialize(self, client_dict):
+            self.debug_paths_stems = client_dict['debug_paths_stems']
+            return None
+
+        #override
+        def process_data(self, data):
+            input_path_stem = Path(data[0]).stem
+            return any ( [ input_path_stem == d_stem for d_stem in self.debug_paths_stems] )
+
+        #override
+        def get_data_name (self, data):
+            #return string identificator of your data
+            return data[0]
+
+    #override
+    def __init__(self, input_paths, debug_paths ):
+        self.input_paths = input_paths
+        self.debug_paths_stems = [ Path(d).stem for d in debug_paths]
+        self.result = []
+        super().__init__('DeletedFilesSearcherSubprocessor', DeletedFilesSearcherSubprocessor.Cli, 60)
+
+    #override
+    def process_info_generator(self):
+        for i in range(min(multiprocessing.cpu_count(), 8)):
+            yield 'CPU%d' % (i), {}, {'debug_paths_stems' : self.debug_paths_stems}
+
+    #override
+    def on_clients_initialized(self):
+        io.progress_bar ("Searching deleted files", len (self.input_paths))
+
+    #override
+    def on_clients_finalized(self):
+        io.progress_bar_close()
+
+    #override
+    def get_data(self, host_dict):
+        if len (self.input_paths) > 0:
+            return [self.input_paths.pop(0)]
+        return None
+
+    #override
+    def on_data_return (self, host_dict, data):
+        self.input_paths.insert(0, data[0])
+
+    #override
+    def on_result (self, host_dict, data, result):
+        if result == False:
+            self.result.append( data[0] )
+        io.progress_bar_inc(1)
+
+    #override
+    def get_result(self):
+        return self.result
+
+def main(detector=None,
+         extract_from_video=False,
+         input_video=None,
+         chunk_size=None,
+         input_path=None,
+         output_path=None,
+         output_debug=None,
+         manual_fix=False,
+         manual_output_debug_fix=False,
+         manual_window_size=1368,
+         face_type='full_face',
+         max_faces_from_image=None,
+         image_size=None,
+         jpeg_quality=None,
+         cpu_only = False,
+         force_gpu_idxs = None,
+         fps=None
+         ):
+
+    if not input_path.exists() and not extract_from_video:
+        io.log_err ('Input directory not found. Please ensure it exists.')
         return
 
-    def _resolve_device_index(self, name, want_output=False):
-        if name is None:
-            return None
-        try:
-            devices = sd.query_devices()
-            for i, d in enumerate(devices):
-                if d.get('name') == name:
-                    if want_output and d.get('max_output_channels',0) > 0:
-                        return i
-                    if not want_output and d.get('max_input_channels',0) > 0:
-                        return i
-        except Exception:
-            pass
-        # fallback to system default index
-        try:
-            di, do = sd.default.device
-            return (do if want_output else di)
-        except Exception:
-            return None
-
-class AudioDelayEngine:
-    def __init__(self, worker: 'FaceSoundPictureWorker'):
-        self.worker = worker
-        self.thread = None
-        self.stop_evt = threading.Event()
-        self.q = queue.Queue(maxsize=64)
-        self.samplerate = 48000
-        self.channels_in = 1
-        self.channels_out = 2
-        self.buffered_frames = 0
-        self.started = False
-
-    def start(self):
-        if sd is None or platform.system().lower() != 'windows':
+    if extract_from_video:
+        if input_video is None:
+            io.log_err ('No input video path given in input')
             return
-        st = self.worker.get_state()
-        self.delay_ms = int(st.av_delay_ms) if getattr(st, 'av_delay_enable', False) else 0
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.stop_evt.clear()
-        self.thread.start()
+        else:
+            if input_video.suffix == '.*':
+                input_video = pathex.get_first_file_by_stem (input_video.parent, input_video.stem)
+            else:
+                if not input_video.exists():
+                    io.log_err("input_file not found.")
+                    return
 
-    def stop(self):
-        self.stop_evt.set()
-        try:
-            if self.thread: self.thread.join(timeout=1.0)
-        except Exception:
-            pass
-        # 建议：置空线程句柄，便于多次启停
-        self.thread = None
+    if not output_path.exists():
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    def set_delay_ms(self, ms:int):
-        prev = getattr(self, 'delay_ms', 0)
-        self.delay_ms = int(ms)
-        # If delay increased, require rebuffering to realize the larger delay
-        if self.delay_ms > prev:
-            self.started = False
-        # If delay set to zero, flush buffer and switch to immediate passthrough
-        if self.delay_ms == 0:
-            try:
-                while not self.q.empty():
-                    _ = self.q.get_nowait()
-            except Exception:
-                pass
-            self.buffered_frames = 0
-            self.started = True
+    if face_type is not None:
+        face_type = FaceType.fromString(face_type)
 
-    def _resolve_device_index(self, name, want_output=False):
-        if name is None:
-            return None
-        try:
-            devices = sd.query_devices()
-            for i, d in enumerate(devices):
-                if d.get('name') == name:
-                    if want_output and d.get('max_output_channels',0) > 0:
-                        return i
-                    if not want_output and d.get('max_input_channels',0) > 0:
-                        return i
-        except Exception:
-            pass
-        # fallback to system default index
-        try:
-            di, do = sd.default.device
-            return (do if want_output else di)
-        except Exception:
-            return None
+    if face_type is None:
+        if manual_output_debug_fix:
+            files = pathex.get_image_paths(output_path)
+            if len(files) != 0:
+                dflimg = DFLIMG.load(Path(files[0]))
+                if dflimg is not None and dflimg.has_data():
+                     face_type = FaceType.fromString ( dflimg.get_face_type() )
 
-    def _run(self):
-        try:
-            st = self.worker.get_state()
-            mic_idx = self._resolve_device_index(st.mic_device, want_output=False)
-            spk_idx = self._resolve_device_index(st.spk_device, want_output=True)
-            if mic_idx is None or spk_idx is None:
-                return
+    if not extract_from_video:
+        input_image_paths = pathex.get_image_unique_filestem_paths(input_path, verbose_print_func=io.log_info)
 
-            # Query rates
-            try:
-                dinfo = sd.query_devices(mic_idx)
-                self.samplerate = int(dinfo.get('default_samplerate', self.samplerate))
-            except Exception:
-                pass
+    output_images_paths = pathex.get_image_paths(output_path)
+    output_debug_path = output_path.parent / (output_path.name + '_debug')
 
-            blocksize = max(256, int(self.samplerate * 0.02))  # ~20ms
-            delay_frames = int(self.samplerate * (self.delay_ms/1000.0))
-            # ensure buffer can hold delay
-            self.q = queue.Queue(maxsize=max(64, delay_frames//blocksize + 8))
-            self.buffered_frames = 0
-            self.started = False
+    continue_extraction = False
+    if not extract_from_video:
+        if not manual_output_debug_fix and len(output_images_paths) > 0:
+            if len(output_images_paths) > 128:
+                continue_extraction = io.input_bool ("继续提取?", True, help_message="提取可以继续，但必须再次指定相同的选项.")
 
-            def in_cb(indata, frames, time_info, status):
-                if status: pass
-                # mono mixdown
-                if indata.ndim > 1:
-                    mono = np.mean(indata, axis=1, keepdims=True)
-                else:
-                    mono = indata.reshape(-1,1)
+            if len(output_images_paths) > 128 and continue_extraction:
                 try:
-                    self.q.put_nowait(mono.copy())
-                    self.buffered_frames += len(mono)
-                except queue.Full:
-                    try:
-                        _ = self.q.get_nowait()
-                        self.q.put_nowait(mono.copy())
-                        # do not change self.buffered_frames here: dropping oldest then adding same length keeps total buffered the same
-                    except Exception:
-                        pass
-                return (None, sd.CallbackFlags())
+                    input_image_paths = input_image_paths[ [ Path(x).stem for x in input_image_paths ].index ( Path(output_images_paths[-128]).stem.split('_')[0] ) : ]
+                except:
+                    io.log_err("获取最后索引时出错。无法继续提取.")
+                    return
+            elif input_path != output_path:
+                    io.input(f"\n 警告 !!! \n {output_path} 包含文件! \n 它们将被删除. \n 按 Enter 继续.\n")
+                    for filename in output_images_paths:
+                        Path(filename).unlink()
 
-            def out_cb(outdata, frames, time_info, status):
-                if status: pass
-                buf = np.zeros((frames, 1), dtype=np.float32)
+    device_config = nn.DeviceConfig.GPUIndexes( force_gpu_idxs or nn.ask_choose_device_idxs(choose_only_one=detector=='manual', suggest_all_gpu=True) ) \
+                    if not cpu_only else nn.DeviceConfig.CPU()
 
-                # Recompute current target delay in frames each callback to reflect runtime changes
-                current_delay_frames = int(self.samplerate * (self.delay_ms/1000.0))
+    if face_type is None:
+        face_type = io.input_str ("人脸类型 Face type", 'wf', ['f','wf','head'], help_message="Full face / whole face / head. 全脸/整张脸/头部.整张脸包括整个脸部区域，包括前额.头部包括整个头部，但需要为源和目标人脸集使用XSeg.").lower()
+        face_type = {'f'  : FaceType.FULL,
+                     'wf' : FaceType.WHOLE_FACE,
+                     'head' : FaceType.HEAD}[face_type]
 
-                # If not started, check buffer fill level; output silence until enough is buffered
-                if not self.started:
-                    if self.buffered_frames >= current_delay_frames:
-                        self.started = True
-                    else:
-                        out = np.repeat(buf, 2, axis=1)
-                        outdata[:] = out
-                        return (None, sd.CallbackFlags())
+    if max_faces_from_image is None:
+        max_faces_from_image = io.input_int(f"每张图像最大人脸数 Max number of faces from image", 0, help_message="如果你提取的源人脸集包含有大量人脸的帧，建议将最大人脸数设置为 3 以加快提取速度。0 - 无限制。")
 
-                # Normal delayed playback: consume from queue
-                i = 0
-                while i < frames:
-                    if self.q.empty():
-                        break
-                    chunk = self.q.get()
-                    take = min(len(chunk), frames - i)
-                    buf[i:i+take, 0] = chunk[:take, 0]
-                    # update buffered_frames accounting
-                    self.buffered_frames = max(0, self.buffered_frames - take)
-                    if take < len(chunk):
-                        rest = chunk[take:]
-                        try:
-                            self.q.put_nowait(rest)
-                        except Exception:
-                            pass
-                    i += take
+    if image_size is None:
+        image_size = io.input_int(f"图像大小 Image size", 512 if face_type < FaceType.HEAD else 768, valid_range=[256,2048], help_message="输出图像尺寸。图像尺寸越大，人脸增强效果越差。仅在源图像足够清晰且无需增强人脸时，使用高于 512 的值")
 
-                out = np.repeat(buf, 2, axis=1)
-                outdata[:] = out
-                return (None, sd.CallbackFlags())
+    if jpeg_quality is None:
+        jpeg_quality = io.input_int(f"图像质量 Jpeg quality", 90, valid_range=[1,100], help_message="JPEG 质量。JPEG 质量越高，输出文件大小越大。")
 
-            with sd.InputStream(device=mic_idx, channels=1, samplerate=self.samplerate, blocksize=blocksize, callback=in_cb):
-                with sd.OutputStream(device=spk_idx, channels=2, samplerate=self.samplerate, blocksize=blocksize, callback=out_cb):
-                    while not self.stop_evt.is_set():
-                        time.sleep(0.01)
-        except Exception:
-            pass
+    if extract_from_video and fps is None:
+        fps = io.input_int ("每秒提取图片数 Enter FPS", 0, help_message="从视频中提取每秒的帧数。0 - 使用完整的帧率")
 
-class Sheet:
-    class Host(lib_csw.Sheet.Host):
-        def __init__(self):
-            super().__init__()
-            self.mic_device  = lib_csw.DynamicSingleSwitch.Client()
-            self.spk_device  = lib_csw.DynamicSingleSwitch.Client()
-            self.av_delay_enable = lib_csw.DynamicSingleSwitch.Client()
-            self.av_delay_ms = lib_csw.Number.Client()
-            self.refresh_devices = lib_csw.Signal.Client()
+    if detector is None:
+        io.log_info ("选择检测器类型.")
+        io.log_info ("[0] S3FD")
+        io.log_info ("[1] 手动")
+        detector = {0:'s3fd', 1:'manual'}[ io.input_int("", 0, [0,1]) ]
 
-    class Worker(lib_csw.Sheet.Worker):
-        def __init__(self):
-            super().__init__()
-            self.mic_device  = lib_csw.DynamicSingleSwitch.Host()
-            self.spk_device  = lib_csw.DynamicSingleSwitch.Host()
-            self.av_delay_enable = lib_csw.DynamicSingleSwitch.Host()
-            self.av_delay_ms = lib_csw.Number.Host()
-            self.refresh_devices = lib_csw.Signal.Host()
 
-class WorkerState(BackendWorkerState):
-    mic_device : str = None
-    spk_device : str = None
-    av_delay_ms : int = 2500
-    av_delay_enable : bool = False
+    if output_debug is None:
+        output_debug = io.input_bool (f"将调试图像写入 {output_debug_path.name}?", False)
+
+    if output_debug:
+        output_debug_path.mkdir(parents=True, exist_ok=True)
+
+    if not extract_from_video:
+        if manual_output_debug_fix:
+            if not output_debug_path.exists():
+                io.log_err(f'{output_debug_path} 未找到，请重新提取带有调试图像选项的人脸')
+                return
+            else:
+                detector = 'manual'
+                io.log_info('正在重新提取从 _debug 目录中删除的帧.')
+
+                input_image_paths = DeletedFilesSearcherSubprocessor (input_image_paths, pathex.get_image_paths(output_debug_path) ).run()
+                input_image_paths = sorted (input_image_paths)
+                io.log_info('发现 %d 张图像.' % (len(input_image_paths)))
+        else:
+            if not continue_extraction and output_debug_path.exists():
+                for filename in pathex.get_image_paths(output_debug_path):
+                    Path(filename).unlink()
+
+    faces_detected = 0
+
+    if not extract_from_video:
+        images_found = len(input_image_paths)
+        if images_found != 0:
+            if detector == 'manual':
+                if not extract_from_video:
+                    io.log_info ('执行手动提取...')
+                    data = ExtractSubprocessor ([ ExtractSubprocessor.Data(filepath=Path(filename)) for filename in input_image_paths ], 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config).run()
+
+                    io.log_info ('执行第三次处理...')
+                    data = ExtractSubprocessor (data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config).run()
+            else:
+                io.log_info ('提取人脸...')
+                data = ExtractSubprocessor ([ ExtractSubprocessor.Data(filepath=Path(filename)) for filename in input_image_paths ] if not extract_from_video else None,
+                                            'all',
+                                            image_size,
+                                            jpeg_quality,
+                                            face_type,
+                                            output_debug_path if output_debug else None,
+                                            max_faces_from_image=max_faces_from_image,
+                                            final_output_path=output_path,
+                                            video_path=input_video,
+                                            device_config=device_config).run()
+
+            faces_detected += sum([d.faces_detected for d in data])
+
+            if manual_fix:
+                if all ( np.array ( [ d.faces_detected > 0 for d in data] ) == True ):
+                    io.log_info ('所有人脸均已检测到，无需手动修复.')
+                else:
+                    fix_data = [ ExtractSubprocessor.Data(filepath=d.filepath) for d in data if d.faces_detected == 0 ]
+                    io.log_info ('对 %d 张图像执行手动修复...' % (len(fix_data)) )
+                    fix_data = ExtractSubprocessor (fix_data, 'landmarks-manual', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, manual_window_size=manual_window_size, device_config=device_config).run()
+                    fix_data = ExtractSubprocessor (fix_data, 'final', image_size, jpeg_quality, face_type, output_debug_path if output_debug else None, final_output_path=output_path, device_config=device_config).run()
+                    faces_detected += sum([d.faces_detected for d in fix_data])
+    else:
+        io.log_info ('提取人脸...')
+        data = None
+        try:
+            sub = ExtractSubprocessor (None,
+                                        'all',
+                                        image_size,
+                                        jpeg_quality,
+                                        face_type,
+                                        output_debug_path if output_debug else None,
+                                        max_faces_from_image=max_faces_from_image,
+                                        final_output_path=output_path,
+                                        video_path=input_video,
+                                        fps=fps,
+                                        chunk_size=chunk_size,
+                                        device_config=device_config)
+            data = sub.run()
+        except KeyboardInterrupt:
+            for process in multiprocessing.active_children():
+                process.terminate()
+
+        if data is not None:
+            faces_detected += sum([d.faces_detected for d in data])
+
+    io.log_info ('-------------------------')
+    io.log_info (f"找到的图像数:        {images_found if not extract_from_video else '未检测到帧. (您正在使用从视频提取模式)'}")
+    io.log_info (f'检测到的人脸数:      {faces_detected}')
+    io.log_info ('-------------------------')
